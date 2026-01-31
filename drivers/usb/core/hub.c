@@ -5488,7 +5488,7 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
                 * If a device is rejected, it is disconnected immediately and a security warning
                 * is logged to the kernel log.
                 *
-                * NOTE:
+                * NOTE: 
                 * This is a defensive mechanism and does not replace full userspace malware
                 * detection or USB authorization frameworks.
                 */
