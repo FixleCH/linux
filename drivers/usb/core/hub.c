@@ -5465,16 +5465,53 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 		mutex_lock(hcd->address0_mutex);
 		retry_locked = true;
 		/* reallocate for each attempt, since references
-		 * to the previous one can escape in various ways
-		 */
-		udev = usb_alloc_dev(hdev, hdev->bus, port1);
-		if (!udev) {
-			dev_err(&port_dev->dev,
-					"couldn't allocate usb_device\n");
-			mutex_unlock(hcd->address0_mutex);
-			usb_unlock_port(port_dev);
-			goto done;
-		}
+                * to the previous one can escape in various ways
+                */
+               udev = usb_alloc_dev(hdev, hdev->bus, port1);
+               if (!udev) {
+                   dev_err(&port_dev->dev, "couldn't allocate usb_device\n");
+                   mutex_unlock(hcd->address0_mutex);
+                   usb_unlock_port(port_dev);
+                   goto done;
+               }
+
+               /*
+                * Security check: detect and block suspicious or potentially corrupted USB devices
+                *
+                * This check is intentionally placed early during device enumeration to prevent
+                * malformed USB descriptors or potentially malicious devices (e.g. infected mass
+                * storage devices) from being fully initialized by the kernel.
+                *
+                * The goal is to reduce the attack surface at kernel level by denying access to
+                * devices that expose invalid descriptors or match high-risk device classes.
+                *
+                * If a device is rejected, it is disconnected immediately and a security warning
+                * is logged to the kernel log.
+                *
+                * NOTE:
+                * This is a defensive mechanism and does not replace full userspace malware
+                * detection or USB authorization frameworks.
+                */
+
+               /* --- Controllo sicurezza avanzato: blocco USB corrotti/sospetti --- */
+               if (!udev->descriptor || !udev->descriptor.bLength || udev->descriptor.bLength > USB_DT_DEVICE_SIZE) {
+                   printk(KERN_ALERT "Banned from kernel: corrupted USB device detected (VID: %04x, PID: %04x) on port %d\n",
+                          udev->descriptor.idVendor, udev->descriptor.idProduct, port1);
+                   usb_free_dev(udev);
+                   mutex_unlock(hcd->address0_mutex);
+                   usb_unlock_port(port_dev);
+                   return -ENODEV;
+               }
+
+               /* Blocco Mass Storage sospetto */
+               if (udev->descriptor.bDeviceClass == USB_CLASS_MASS_STORAGE) {
+                   printk(KERN_ALERT "Banned from kernel: mass storage device potentially infected (VID: %04x, PID: %04x) on port %d\n",
+                          udev->descriptor.idVendor, udev->descriptor.idProduct, port1);
+                   usb_free_dev(udev);
+                   mutex_unlock(hcd->address0_mutex);
+                   usb_unlock_port(port_dev);
+                   return -ENODEV;
+               }
 
 		usb_set_device_state(udev, USB_STATE_POWERED);
 		udev->bus_mA = hub->mA_per_port;
