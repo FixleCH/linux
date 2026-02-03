@@ -45,13 +45,6 @@
 
 #include "smpboot.h"
 
-/* Maximum lengths for mitigation command line parsing */
-#define MAX_CMDLINE_MITIGATION_LEN	1024
-#define MAX_MITIGATION_TOKEN_LEN	64
-
-/* Lock for protecting cpus_booted_once_mask */
-static DEFINE_SPINLOCK(cpus_booted_lock);
-
 /**
  * struct cpuhp_cpu_state - Per cpu hotplug state storage
  * @state:	The current cpu state
@@ -174,7 +167,6 @@ static bool cpuhp_step_empty(bool bringup, struct cpuhp_step *step)
  *
  * Return: %0 on success or a negative errno code
  */
-/* Versione CORRETTA - Rollback logic migliorato */
 static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
 				 bool bringup, struct hlist_node *node,
 				 struct hlist_node **lastp)
@@ -184,7 +176,6 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
 	int (*cbm)(unsigned int cpu, struct hlist_node *node);
 	int (*cb)(unsigned int cpu);
 	int ret, cnt;
-	struct hlist_node *iter, *tmp;
 
 	if (st->fail == state) {
 		st->fail = CPUHP_INVALID;
@@ -218,18 +209,18 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
 
 	/* State transition. Invoke on all instances */
 	cnt = 0;
-	hlist_for_each_safe(iter, tmp, &step->list) {
-		if (lastp && iter == *lastp)
+	hlist_for_each(node, &step->list) {
+		if (lastp && node == *lastp)
 			break;
 
-		trace_cpuhp_multi_enter(cpu, st->target, state, cbm, iter);
-		ret = cbm(cpu, iter);
+		trace_cpuhp_multi_enter(cpu, st->target, state, cbm, node);
+		ret = cbm(cpu, node);
 		trace_cpuhp_exit(cpu, st->state, state, ret);
 		if (ret) {
 			if (!lastp)
 				goto err;
 
-			*lastp = iter;
+			*lastp = node;
 			return ret;
 		}
 		cnt++;
@@ -238,45 +229,24 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
 		*lastp = NULL;
 	return 0;
 err:
-	{
-		/* Rollback the instances if one failed */
-		int (*rollback_cbm)(unsigned int cpu, struct hlist_node *node);
-		int rollback_ret;
-		struct hlist_node *rollback_node;
-		int rollback_cnt = 0;
-		
-		rollback_cbm = !bringup ? step->startup.multi : step->teardown.multi;
-		if (!rollback_cbm)
-			return ret;
+	/* Rollback the instances if one failed */
+	cbm = !bringup ? step->startup.multi : step->teardown.multi;
+	if (!cbm)
+		return ret;
 
+	hlist_for_each(node, &step->list) {
+		if (!cnt--)
+			break;
+
+		trace_cpuhp_multi_enter(cpu, st->target, state, cbm, node);
+		ret = cbm(cpu, node);
+		trace_cpuhp_exit(cpu, st->state, state, ret);
 		/*
-		 * Rollback must not fail for atomic states (STARTING/DYING).
-		 * For non-atomic states, we try to continue rollback but
-		 * log an error if it fails.
+		 * Rollback must not fail,
 		 */
-		hlist_for_each(rollback_node, &step->list) {
-			if (rollback_cnt >= cnt)  
-				break;
-				
-			rollback_cnt++;
-			trace_cpuhp_multi_enter(cpu, st->target, state, 
-						rollback_cbm, rollback_node);
-			rollback_ret = rollback_cbm(cpu, rollback_node);
-			trace_cpuhp_exit(cpu, st->state, state, rollback_ret);
-			
-			if (rollback_ret) {
-				if (cpuhp_is_atomic_state(state)) {
-					/* Atomic states: rollback failure is fatal */ 
-					WARN_ON_ONCE(rollback_ret);
-				} else {
-					/* Non-atomic states: log but continue */
-					pr_err("CPU%u: Rollback failed at state %s (%d): %d\n",
-					       cpu, step->name, state, rollback_ret);
-				}
-			}
-		}
-		return ret; 
+		WARN_ON_ONCE(ret);
 	}
+	return ret;
 }
 
 /*
@@ -721,18 +691,8 @@ static inline bool cpu_bootable(unsigned int cpu)
 	 * that the init code can get a chance to set CR4.MCE on each
 	 * CPU. Otherwise, a broadcasted MCE observing CR4.MCE=0b on any
 	 * core will shutdown the machine.
-	 *
-	 * Access to cpus_booted_once_mask must be synchronized to prevent
-	 * race conditions between concurrent hotplug operations.
 	 */
-	bool bootable;
-	unsigned long flags;
-	
-	spin_lock_irqsave(&cpus_booted_lock, flags);
-	bootable = !cpumask_test_cpu(cpu, &cpus_booted_once_mask);
-	spin_unlock_irqrestore(&cpus_booted_lock, flags);
-	
-	return bootable;
+	return !cpumask_test_cpu(cpu, &cpus_booted_once_mask);
 }
 
 /* Returns true if SMT is supported and not forcefully (irreversibly) disabled */
@@ -1511,29 +1471,27 @@ static long __cpu_down_maps_locked(void *arg)
 static int cpu_down_maps_locked(unsigned int cpu, enum cpuhp_state target)
 {
 	struct cpu_down_work work = { .cpu = cpu, .target = target, };
-		int control_cpu;
 
-		/*
-		* If the platform does not support hotplug, report it explicitly to
-		* differentiate it from a transient offlining failure.
-		*/
-		if (cpu_hotplug_offline_disabled)
-			return -EOPNOTSUPP;
-		if (cpu_hotplug_disabled)
-			return -EBUSY;
-
-		/*
-		* Ensure that the control task does not run on the to be offlined
-		* CPU to prevent a deadlock against cfs_b->period_timer.
-		* Also keep at least one housekeeping cpu onlined to avoid generating
-		* an empty sched_domain span.
-		*/
-		for_each_cpu_and(control_cpu, cpu_online_mask, 
-				housekeeping_cpumask(HK_TYPE_DOMAIN)) {
-			if (control_cpu != work.cpu)
-				return work_on_cpu(control_cpu, __cpu_down_maps_locked, &work);
-		}
+	/*
+	 * If the platform does not support hotplug, report it explicitly to
+	 * differentiate it from a transient offlining failure.
+	 */
+	if (cpu_hotplug_offline_disabled)
+		return -EOPNOTSUPP;
+	if (cpu_hotplug_disabled)
 		return -EBUSY;
+
+	/*
+	 * Ensure that the control task does not run on the to be offlined
+	 * CPU to prevent a deadlock against cfs_b->period_timer.
+	 * Also keep at least one housekeeping cpu onlined to avoid generating
+	 * an empty sched_domain span.
+	 */
+	for_each_cpu_and(cpu, cpu_online_mask, housekeeping_cpumask(HK_TYPE_DOMAIN)) {
+		if (cpu != work.cpu)
+			return work_on_cpu(cpu, __cpu_down_maps_locked, &work);
+	}
+	return -EBUSY;
 }
 
 static int cpu_down(unsigned int cpu, enum cpuhp_state target)
@@ -1630,14 +1588,9 @@ void notify_cpu_starting(unsigned int cpu)
 {
 	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
 	enum cpuhp_state target = min((int)st->target, CPUHP_AP_ONLINE);
-	unsigned long flags;
 
 	rcutree_report_cpu_starting(cpu);	/* Enables RCU usage on this CPU. */
-	
-	/* Protect concurrent access to cpus_booted_once_mask */
-	spin_lock_irqsave(&cpus_booted_lock, flags);
 	cpumask_set_cpu(cpu, &cpus_booted_once_mask);
-	spin_unlock_irqrestore(&cpus_booted_lock, flags);
 
 	/*
 	 * STARTING must not fail!
@@ -2531,7 +2484,6 @@ int __cpuhp_setup_state_cpuslocked(enum cpuhp_state state,
 {
 	int cpu, ret = 0;
 	bool dynstate;
-	enum cpuhp_state allocated_state = state;
 
 	lockdep_assert_cpus_held();
 
@@ -2542,12 +2494,10 @@ int __cpuhp_setup_state_cpuslocked(enum cpuhp_state state,
 
 	ret = cpuhp_store_callbacks(state, name, startup, teardown,
 				    multi_instance);
-	if (ret < 0)
-		goto out_unlock;
 
 	dynstate = state == CPUHP_AP_ONLINE_DYN || state == CPUHP_BP_PREPARE_DYN;
 	if (ret > 0 && dynstate) {
-		allocated_state = ret;
+		state = ret;
 		ret = 0;
 	}
 
@@ -2562,15 +2512,14 @@ int __cpuhp_setup_state_cpuslocked(enum cpuhp_state state,
 		struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
 		int cpustate = st->state;
 
-		if (cpustate < allocated_state)
+		if (cpustate < state)
 			continue;
 
-		ret = cpuhp_issue_call(cpu, allocated_state, true, NULL);
+		ret = cpuhp_issue_call(cpu, state, true, NULL);
 		if (ret) {
-			/* Rollback on failure */
 			if (teardown)
-				cpuhp_rollback_install(cpu, allocated_state, NULL);
-			cpuhp_store_callbacks(allocated_state, NULL, NULL, NULL, false);
+				cpuhp_rollback_install(cpu, state, NULL);
+			cpuhp_store_callbacks(state, NULL, NULL, NULL, false);
 			goto out;
 		}
 	}
@@ -2581,11 +2530,7 @@ out:
 	 * return the dynamically allocated state in case of success.
 	 */
 	if (!ret && dynstate)
-		return allocated_state;
-	return ret;
-	
-out_unlock:
-	mutex_unlock(&cpuhp_state_mutex);
+		return state;
 	return ret;
 }
 EXPORT_SYMBOL(__cpuhp_setup_state_cpuslocked);
@@ -3339,13 +3284,6 @@ static int __init mitigations_parse_cmdline(char *arg)
 {
 	char *s, *p;
 	int len;
-	
-	/* Validate input length to prevent potential overflows */
-	if (strlen(arg) > MAX_CMDLINE_MITIGATION_LEN) {
-		pr_crit("Mitigation parameter too long, max %d characters\n",
-			MAX_CMDLINE_MITIGATION_LEN);
-		return -EINVAL;
-	}
 
 	len = mitigations_parse_global_opt(arg);
 
@@ -3363,17 +3301,11 @@ static int __init mitigations_parse_cmdline(char *arg)
 
 	/* Attack vector controls may come after the ',' */
 	if (*p++ != ',' || !IS_ENABLED(CONFIG_ARCH_HAS_CPU_ATTACK_VECTORS)) {
-		pr_crit("Unsupported mitigations=%s, system may still be vulnerable\n", arg);
+		pr_crit("Unsupported mitigations=%s, system may still be vulnerable\n",	arg);
 		return 0;
 	}
 
-	while ((s = strsep(&p, ",")) != NULL && *s) {
-		/* Skip empty tokens and limit token length */
-		if (strlen(s) > MAX_MITIGATION_TOKEN_LEN) {
-			pr_crit("Mitigation token too long: %s\n", s);
-			return -EINVAL;
-		}
-		
+	while ((s = strsep(&p, ",")) != NULL) {
 		switch (match_token(s, vector_mitigations, NULL)) {
 		case NO_USER_KERNEL:
 			attack_vectors[CPU_MITIGATE_USER_KERNEL] = false;
@@ -3391,8 +3323,8 @@ static int __init mitigations_parse_cmdline(char *arg)
 			smt_mitigations = SMT_MITIGATIONS_OFF;
 			break;
 		default:
-			pr_crit("Unsupported mitigation option: %s\n", s);
-			return -EINVAL;
+			pr_crit("Unsupported mitigations options %s\n",	s);
+			return 0;
 		}
 	}
 
